@@ -2,29 +2,32 @@
 '''Automatically downloading all genomes belonging to a certain species from NCBI refseq and genbank databases
 '''
 
+#TODO: download should be moved to the process_sample part
+
 import csv
 import re
 import os
 import argparse
 import multiprocessing as mp
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import pandas as pd
 from functools import reduce
 import requests
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import gzip
 import shutil
 import logging
 from itertools import chain
+import subprocess
 
 #Utility functions
 
 def get_pargs():
 	"""Parse command-line arguments for the script."""
 	parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-	parser.add_argument("-n",help="Number of threads",default=80,type=int)
+	parser.add_argument("-n",help="Number of threads",default=20,type=int)
 	parser.add_argument("-gd",help="Directory of genomes",default="Genomes")
 	return parser.parse_args()
 
@@ -33,20 +36,35 @@ def init_logging():
 	"""
 	Initialize logging for the application.
 	"""
-	log_filename = "{}.{}.log".format(__file__.replace(".py3", ""), time.strftime("%Y%m%d%H%M%S"))
+	log_dir = "Logging"
+	os.makedirs(log_dir, exist_ok=True)
+	log_filename = os.path.join(log_dir, os.path.basename(f"{__file__.replace('.py3', '')}.{time.strftime('%Y%m%d%H%M%S')}.log"))
 	logging.basicConfig(
 		format='%(asctime)s. %(levelname)s: %(message)s',
 		filename=log_filename,
 		level=logging.INFO,
 		datefmt='%Y-%m-%d %H:%M:%S'
 	)
-	logging.info("Run started")
+	print(f"Run started, logging to {log_filename}")
+	logging.info(f"Run started")
 
-def msg(text):
+def msg(text,onscreen=False):
 	"""Print timestamped messages."""
 	uzenet = f"{time.strftime('%H:%M:%S')} {text}"
-	print(uzenet)
+	if onscreen:
+		print(uzenet)
 	logging.info(uzenet)
+
+def info(text):
+	msg(text, True)
+
+def error(text,onscreen=True):
+	"""Print timestamped messages."""
+	uzenet = f"{time.strftime('%H:%M:%S')} {text}"
+	if onscreen:
+		print(uzenet)
+	logging.error(uzenet)
+
 
 def mkdir_force(path):
 	"""Create a directory if it doesn't exist."""
@@ -139,10 +157,16 @@ def define_config():
 		"urinary": "Metadata/urinary.genomes.tsv",
 		'urinary_reads': "Metadata/urinary.genomes.readlinks.tsv",
 		"urinary_with_dates_and_locations": "Metadata/urinary.genomes.dates_and_locations.tsv",
-		"reference": "Reference/GCF_000005845.2_ASM584v2_genomic.fna",
+		"reference": "Reference/GCF_000005845.2.fa",
 		"reference_link": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz",
-		"denovo": "Denovo",
-		"trimmed": "Trimmed_reads"
+		"denovo": "Intermediate_files/Denovo",
+		"assemblies": "Assemblies",
+		"stats": "Statistics",
+		"raw_reads": "Raw_reads",
+		"trimmed": "Intermediate_files/Trimmed_reads",
+		"commands": "Metadata/assembly_commands.tsv",
+		'minlen': 1000,
+		'mincov': 10,
 	}
 	return config
 
@@ -151,7 +175,7 @@ def define_config():
 def download_assembly_summary(source, target):
 	"""Download assembly summary for the specified source."""
 	if os.path.isfile(target):
-		msg(f"{target} exists, skipping download.")
+		info(f"{target} exists, skipping download.")
 		return
 	wget_cmd = f"wget -nc https://ftp.ncbi.nlm.nih.gov/genomes/{source}/assembly_summary_{source}.txt -O {target}"
 	sysexec(wget_cmd)
@@ -159,9 +183,9 @@ def download_assembly_summary(source, target):
 def filter_summary(source,result):
 	"""Filter the assembly summary for the target species."""
 	if os.path.isfile(result):
-		print(f"{result} is ready, I skip filtering")
+		info(f"{result} is ready, I skip filtering")
 		return
-	print(f"Filtering {source} -> {result}")
+	info(f"Filtering {source} -> {result}")
 	with open(source) as f, open(result,"a") as g:
 		rdr = csv.reader(f,delimiter='\t')
 		wtr = csv.writer(g,delimiter="\t")
@@ -174,9 +198,9 @@ def filter_summary(source,result):
 def get_biosamples_table(summary,output,column,header=True):
 	"""Extract unique biosample IDs from the assembly summary."""
 	if os.path.isfile(output):
-		msg(f"Skipping biosample extraction: {output} exists.")
+		info(f"Skipping biosample extraction: {output} exists.")
 		return
-	msg(f"Extracting biosamples from {summary} to {output}")
+	info(f"Extracting biosamples from {summary} to {output}")
 	with open(summary) as f:
 		rdr = csv.reader(f, delimiter="\t")
 		if header:
@@ -187,65 +211,10 @@ def get_biosamples_table(summary,output,column,header=True):
 			g.write(bs + "\n")
 
 
-###Currently out of use
-def collect_unique_identifiers(genomes,download_file,unique_genomes_file):
-	"""Collect unique genome identifiers and generate download commands."""
-	if os.path.isfile(unique_genomes_file):
-		msg(f"{unique_genomes_file} is already created")
-		return
-	msg(f"Collecting unique identifiers from {genomes}")
-	with open(genomes) as f:
-		rdr = csv.reader(f,delimiter="\t")
-		biosamples = {}
-		links = {}
-		asm_name = {}
-		for row in rdr:
-			if row[2] not in biosamples:
-				biosamples[row[2]] = []
-			biosamples[row[2]].append(row[0])
-			links[row[0]] = row[19]
-			asm_name[row[0]] = row[15]
-	unique_genomes = []
-	download_cmd = []
-	with open(download_file,"w") as g, open(unique_genomes_file,"w") as g2:
-		wtr2 = csv.writer(g2,delimiter="\t")
-		wtr2.writerow(["Genome","Biosample"])
-		for sample in biosamples:
-			if len(biosamples[sample]) == 1:
-				best_genome = biosamples[sample][0]
-			else:
-				ranking = {}
-				for item in biosamples[sample]:
-					if item[2] == "F":
-						ranking[item] = 100
-					else:
-						ranking[item] = 0
-					ranking[item] += smartint(item[-1])
-				best_genome = max(biosamples[sample],key = lambda x: ranking[x])
-			link = os.path.join(f"{links[best_genome]}",f"{os.path.basename(links[best_genome])}_genomic.fna.gz")
-			out_genome = os.path.join(GENOME_DIR, best_genome)
-			g.write(f"wget -q -nc {link} -O {out_genome}.fna.gz\n")
-			wtr2.writerow([best_genome,sample])
-	msg(f"Ready with {download_file} and {unique_genomes_file}")
-
-
-
-
-#Currently unused
-def download_all(dl_file,downloaded):
-	if os.path.isfile(downloaded):
-		print("Genomes are already downloaded, skipping")
-		return
-	pool = mp.Pool(pargs.n)
-	links = read_file_lines(dl_file)
-	pool.map(download,links)
-	sysexec(f"touch {downloaded}")
-
-
 def merge_biosamples(databases, output):
 	"""Merge biosample data from multiple databases."""
 	if os.path.isfile(output):
-		msg(f"{output} exists, skipping merge.")
+		info(f"{output} exists, skipping merge.")
 		return
 	biosample_data = {}
 	all_biosamples = set()
@@ -265,7 +234,7 @@ def merge_biosamples(databases, output):
 			row = {db: (1 if bs in biosample_data[db] else 0)  for db in databases}
 			row["BioSample"] = bs
 			wtr.writerow(row)
-	print(f"Ready with {output}")
+	info(f"Ready with {output}")
 
 
 
@@ -278,9 +247,9 @@ def get_urinary_pathogens(fname, output_file):
 	:param output_file: Output file name for filtered results.
 	"""
 	if os.path.isfile(output_file):
-		msg(f"I refuse to overwrite {output_file}, skipping filtering of pathogens")
+		info(f"I refuse to overwrite {output_file}, skipping filtering of pathogens")
 		return
-	msg(f"Get urinary related genomes from {fname}")
+	info(f"Get urinary related genomes from {fname}")
 	try:
 		with open(fname, "r", newline="", encoding="utf-8") as infile, open(output_file, "w", newline="", encoding="utf-8") as outfile:
 			reader = csv.reader(infile, delimiter="\t")
@@ -318,7 +287,7 @@ def get_urinary_pathogens(fname, output_file):
 def fetch_biosample_data(biosample_table,output,failed,log):
 	"""Fetch biosample data from NCBI and log the results."""
 	if os.path.isfile(output):
-		msg(f"I don't want to overwrite {output}, so I skip fetching biosample data from NCBI")
+		info(f"I don't want to overwrite {output}, so I skip fetching biosample data from NCBI")
 		return
 	sysexec(f'''tail -n +2 {biosample_table} | cut -f 1 | xargs -P 8 -I {{}} sh -c 'efetch -db biosample -format full -id {{}} || echo "Failed ID: {{}}" >> {failed}' > {output} 2> {log}''')
 
@@ -326,9 +295,9 @@ def fetch_biosample_data(biosample_table,output,failed,log):
 def convert_raw_biosamples_to_csv(fname, output_file):
 	"""Convert raw biosample data to a structured CSV file."""
 	if os.path.isfile(output_file):
-		msg(f"{output_file} exists, I refuse to overwrite, skipping converting raw biosample data to table")
+		info(f"{output_file} exists, skipping converting raw biosample data to table")
 		return
-	msg(f"Convert {fname} to table")
+	info(f"Convert {fname} to table")
 	records = []
 	my_entry = defaultdict(str)
 	with open(fname) as f:
@@ -372,17 +341,17 @@ def convert_raw_biosamples_to_csv(fname, output_file):
 		for record in records:
 			row = {attribute: record.get(attribute,'') for attribute in header}
 			writer.writerow(row)
-	msg(f"Ready with {output_file}")
+	info(f"Ready with {output_file}")
 
 
 
 def get_urinary_biosamples(input_file, output_file):
 	"""Filter urinary-related biosamples based on specific conditions and save to a file."""
 	if os.path.isfile(output_file):
-		msg(f"Refusing to overwrite existing {output_file}, skipping filtering urinary genomes from biosample metadata")
+		info(f"Refusing to overwrite existing {output_file}, skipping filtering urinary genomes")
 		return
 		
-	msg(f"Get urinary related genomes from {input_file}")
+	info(f"Get urinary related genomes from {input_file}")
 	
 	#Columns to prioritize in the output
 	columns_to_select = ["BioSample", "collection date", "geographic location",  "isolation source", "strain", "source type", "host", "host description", "host disease", "host disease outcome", "study disease", "serotype", "pathotype", "environmental sample", "sample type", "Entry notes"]
@@ -393,7 +362,7 @@ def get_urinary_biosamples(input_file, output_file):
 	
 	df = load_or_create_feather(input_file, f"{input_file}.feather")
 	
-	msg("Dropping rows with non-E.coli, with missing collection date or geographic location")
+	info("Dropping rows with non-E.coli, with missing collection date or geographic location")
 	conditions = [
 		df['Organism'].str.startswith("Escherichia coli"),
 		df['collection date'].str.strip().ne(""),
@@ -410,36 +379,36 @@ def get_urinary_biosamples(input_file, output_file):
 	
 	
 	# Search for keywords in any of the columns in `columns_to_select`
-	msg("Checking urinary keywords")
+	info("Checking urinary keywords")
 	df_filtered['keyword_match'] = df_filtered[columns_to_select].apply(
 	lambda row: any(keyword in " ".join(map(str, row)).lower() for keyword in keywords), axis=1
 	)
 
 	# Search for human_keywords in the entire row
-	msg("Checking human keywords")
+	info("Checking human keywords")
 	df_filtered['human_match'] = df_filtered[columns_to_select].apply(
 		lambda row: any(human_keyword in " ".join(map(str, row)).lower() for value in row for human_keyword in human_keywords),
 		axis=1
 	)
 
 	# Keep rows where both keyword and human matches are true
-	msg("Filtering")
+	info("Filtering")
 	final_df = df_filtered[df_filtered['keyword_match'] & df_filtered['human_match']].drop(
 		columns=['keyword_match', 'human_match']
 	)
 	
 	final_df = final_df.dropna(axis=1, how ='all').copy()
-
+	
 	# Write the filtered results to a file
 	final_df.to_csv(output_file, index=False, sep="\t")
-	msg(f"Filtered results written to {output_file}")
+	info(f"Filtered results written to {output_file}")
 
 def merge_pathogens_and_biosample_metadata(pathogens_file, biosamples_file, biosample_sources, output_file):
 	"""Merge tables by the 'BioSample' column and add prefixes to distinguish column origins."""
 	if os.path.isfile(output_file):
-		msg(f"{output_file} is ready, skip merging")
+		info(f"{output_file} is ready, skip merging")
 		return
-	msg(f"Merging {pathogens_file} and {biosamples_file}")
+	info(f"Merging {pathogens_file} and {biosamples_file}")
 	# Read the tables
 	pathogens_df = pd.read_csv(pathogens_file, sep="\t", dtype=str)
 	biosamples_df = pd.read_csv(biosamples_file, sep="\t", dtype=str)
@@ -465,7 +434,7 @@ def merge_pathogens_and_biosample_metadata(pathogens_file, biosamples_file, bios
 
 	# Save the merged DataFrame
 	merged_df.to_csv(output_file, sep="\t", index=False)
-	msg(f"Merged table saved to {output_file}")
+	info(f"Merged table saved to {output_file}")
 
 
 def fetch_read_identifiers(infile, batch_size=20):
@@ -474,7 +443,7 @@ def fetch_read_identifiers(infile, batch_size=20):
 	mkdir_force("Metadata/Reads")
 	downloaded_flag = "Metadata/Reads/batches_downloaded.flag"
 	if os.path.isfile(downloaded_flag):
-		msg("Read identifiers are already retrieved. Skipping this part.")
+		info("Read identifiers are already retrieved. Skipping this part.")
 		return
 	biosample_ids = get_biosamples(infile)
 	# Create batches of BioSamples
@@ -490,16 +459,16 @@ def fetch_read_identifiers(infile, batch_size=20):
 		api_url = f"https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=({query})&fields=sample_accession,instrument_platform,fastq_ftp"
 
 		# Perform the request
-		msg(f"Fetching data? API url: {api_url}")
+		msg(f"Fetching data: API url: {api_url}")
 		response = requests.get(api_url)
 
 		# Check for successful response
 		if response.status_code == 200:
 			with open(output_file, "w") as f:
 				f.write(response.text)
-			print(f"Saved batch {i//batch_size + 1} to {output_file}")
+			msg(f"Saved batch {i//batch_size + 1} to {output_file}")
 		else:
-			print(f"Failed to fetch batch {i//batch_size + 1}: {response.status_code}")
+			error(f"Failed to fetch batch {i//batch_size + 1}: {response.status_code}")
 	emptyfile(downloaded_flag)
 
 
@@ -509,7 +478,7 @@ def get_biosamples(infile):
 def concat_batches(infile, output_file, batch_size=20):
 	"""Concatenate all batch files into a single file, keeping only one header."""
 	if os.path.isfile(output_file):
-		msg(f"{output_file} exists. I'll skip concatenating batches.")
+		info(f"{output_file} exists. I'll skip concatenating batches.")
 		return
 	biosample_ids = get_biosamples(infile)
 	# Create batches of BioSamples
@@ -530,11 +499,11 @@ def concat_batches(infile, output_file, batch_size=20):
 
 	# Save the final concatenated DataFrame
 	merged_df.to_csv(output_file, sep="\t", index=False)
-	print(f"All batch files concatenated into {output_file}")
+	info(f"All batch files concatenated into {output_file}")
 
 
 
-def download_reads(input_file, genomes, output_dir="Raw_reads", max_threads=20, errors="Metadata/biosamples.no_reads_from_ena.list"):
+def download_reads(input_file, genomes, output_dir, max_threads=20, errors="Metadata/biosamples.no_reads_from_ena.list"):
 	"""
 	Download reads from the provided file and rename them based on BioSample IDs.
 	
@@ -543,10 +512,10 @@ def download_reads(input_file, genomes, output_dir="Raw_reads", max_threads=20, 
 	"""
 	# Ensure the output directory exists
 	flag = "Metadata/raw_reads_downloaded.flag"
-	#if os.path.isfile(flag):
-	#	msg("All reads are downloaded")
-	#	return
-	msg("Downloading raw reads - collecting download links")
+	if os.path.isfile(flag):
+		info("All reads are downloaded")
+		return
+	info("Downloading raw reads - collecting download links")
 	os.makedirs(output_dir, exist_ok=True)
 	biosample_list = get_biosamples(genomes)
 	download_tasks = []
@@ -565,7 +534,7 @@ def download_reads(input_file, genomes, output_dir="Raw_reads", max_threads=20, 
 			runs += 1
 			for item in row['fastq_ftp'].split(";"):
 				download_tasks.append([item, os.path.join(output_dir, os.path.basename(item))])
-	msg(f"Now starting download for {len(download_tasks)} links for {runs} runs. Skipping {not_illumina} runs which are not sequenced on Illumina")
+	info(f"Now starting download for {len(download_tasks)} links for {runs} runs. Skipping {not_illumina} runs which are not sequenced on Illumina")
 	with ThreadPoolExecutor(max_threads) as executor:
 		executor.map(lambda task: download_file(*task), download_tasks)
 	emptyfile(flag)
@@ -593,22 +562,25 @@ def download_file(link, output_path):
 			for chunk in response.iter_content(chunk_size=8192):
 				temp_file.write(chunk)
 		os.rename(temp_path, output_path)
-		print(f"Downloaded and saved: {output_path}")
+		msg(f"Downloaded and saved: {output_path}")
 	except requests.exceptions.RequestException as e:
-		print(f"HTTP request failed for {link}: {e}")
+		error(f"HTTP request failed for {link}: {e}")
 	except Exception as e:
-		print(f"An error occurred while downloading {link}: {e}")
+		error(f"An error occurred while downloading {link}: {e}")
 	finally:
 		try:
 			if os.path.isfile(temp_path):
 				os.remove(temp_path)
 		except Exception as cleanup_error:
-			print(f"Failed to clean up temp file {temp_path}: {cleanup_error}")
+			error(f"Failed to clean up temp file {temp_path}: {cleanup_error}")
 
 
 
 def filter_and_transform_genomes(input_file, output_file):
 	"""Filter and transform the urinary_genomes.tsv file."""
+	if os.path.isfile(output_file):
+		info(f"Skip filtering genomes, as {output_file} exists")
+		return
 	# Read the input file
 	df = pd.read_csv(input_file, sep="\t", dtype=str)
 
@@ -697,7 +669,7 @@ def filter_and_transform_genomes(input_file, output_file):
 
 	# Save the filtered DataFrame to the output file
 	df.to_csv(output_file, sep="\t", index=False)
-	print(f"Filtered and transformed data saved to {output_file}")
+	info(f"Filtered and transformed data saved to {output_file}")
 
 
 def download_and_extract(url, output_file):
@@ -722,7 +694,57 @@ def get_reference_genome():
 		mkdir_force(os.path.dirname(config['reference']))
 	download_and_extract(config['reference_link'], config['reference'])
 
-def prepare_assembly_commands(genomes, links):
+
+def check_gz_integrity(gz):
+	"""Check the integrity of a gzip file."""
+	if not os.path.isfile(gz):
+		logging.error(f"{gz} does not exist.")
+		return False
+	res = os.system(f"gzip -t {gz} > /dev/null 2>&1") == 0
+	msg(f"{gz} is ok" if res else f"ERROR: {gz} is corrupt")
+	return res
+
+def read_cmd(cmd):
+	"""
+	Execute a shell command and return its output.
+
+	:param cmd: The shell command to execute.
+	:return: The output of the command as a string, with leading and trailing whitespace removed.
+	:raises RuntimeError: If the command fails to execute.
+	"""
+	try:
+		return subprocess.check_output(cmd, shell=True, text=True).strip()
+	except subprocess.CalledProcessError as e:
+		raise RuntimeError(f"Command failed with error code {e.returncode}: {cmd}\n{e.output}")
+	except Exception as e:
+		raise RuntimeError(f"An unexpected error occurred while running the command: {cmd}\n{e}")
+
+def get_fa_names(fa):
+	"""
+	Extract sequence names from a FASTA/FASTQ file using seqtk.
+
+	:param fa: Path to the FASTA/FASTQ file.
+	:return: A list of sequence names.
+	:raises RuntimeError: If the command fails or the input file is invalid.
+	"""
+	if not os.path.isfile(fa):
+		raise RuntimeError(f"File not found: {fa}")
+
+	try:
+		# Use seqtk to get sequence names
+		output = read_cmd(f'seqtk comp {fa} | cut -f 1')
+		return output.split("\n") if output else []
+	except RuntimeError as e:
+		raise RuntimeError(f"Failed to extract sequence names from {fa}: {e}")
+
+
+def check_paired(fa1, fa2):
+	names1 = get_fa_names(fa1)
+	names2 = get_fa_names(fa2)
+	return names1 == names2
+
+
+def prepare_assembly_commands(genomes, links, outfile):
 	"""
 	Generate assembly commands using cutadapt for trimming and SPAdes for assembly.
 
@@ -730,71 +752,454 @@ def prepare_assembly_commands(genomes, links):
 	:param links: Path to the links file containing sample_accession and fastq_ftp columns.
 	:param config: Dictionary containing output paths for trimmed reads and assemblies.
 	"""
-	msg("Generating assembly commands")
+	if os.path.isfile(outfile):
+		info(f"{outfile} exists, I skip preparing assembly commands")
+		return
+	info("Generating assembly commands")
 	# Get biosamples and their corresponding fastq files
 	biosamples = get_biosamples(genomes)
-	df = pd.read_csv(links, sep="\t", usecols=["sample_accession", "fastq_ftp"]).fillna("")
-	biosample_fastq_dict = {row["sample_accession"]: get_downloaded_names(row["sample_accession"], row["fastq_ftp"], savelinks=False) for _, row in df.iterrows()}
+	df = pd.read_csv(links, sep="\t").fillna("")
 	
-	commands = []
-
-	for bs in biosamples:
-		fq_files = biosample_fastq_dict.get(bs, [])
-		if not fq_files:
-			logging.info(f"{bs}: missing reads, assembly not possible")
+	header = ["BioSample","Run","fastq_ftp","SE", "R1", "R2","SE trim","R1 trim", "R2 trim","Same name in paired-end","trim","spades"]
+	
+	datarows = {}
+	
+	for _,row in df.iterrows():
+		run_acc = row.get("run_accession")
+		bs = row.get("sample_accession")
+		fq_files = row.get("fastq_ftp","").split(";")
+		if row.get("instrument_platform") != "ILLUMINA" or not (run_acc and bs and fq_files and bs in biosamples):
 			continue
-
+		
 		# Classify the fastq files
-		se_reads = [fq for fq in fq_files if ".SE" in fq]
-		r1_reads = [fq for fq in fq_files if ".R1." in fq]
-		r2_reads = [fq for fq in fq_files if ".R2." in fq]
-
+		r1_reads = [os.path.basename(fq) for fq in fq_files if fq.endswith("_1.fastq.gz")]
+		r2_reads = [os.path.basename(fq) for fq in fq_files if fq.endswith("_2.fastq.gz")]
+		se_reads = [os.path.basename(fq) for fq in fq_files if fq and os.path.basename(fq) not in (r1_reads + r2_reads)]
+		r1_trimmed_reads = []
+		r2_trimmed_reads = []
+		se_trimmed_reads = []
+		
+		#Map raw and trimmed file paths
+		raw = {read: os.path.join(config['raw_reads'], read) for read in r1_reads + r2_reads + se_reads}
+		trimmed = {read: os.path.join(config['trimmed'], f"{read.replace('.fastq.gz','')}.trimmed.fastq.gz") for read in r1_reads + r2_reads + se_reads}
+		
+		data = {
+			"BioSample": bs,
+			"Run": run_acc,
+			"fastq_ftp": row.get("fastq_ftp",""),
+			"SE": ", ".join(raw[read] for read in se_reads),
+			"R1": ", ".join(raw[read] for read in r1_reads),
+			"R2": ", ".join(raw[read] for read in r2_reads),
+			"SE trim": ", ".join(trimmed[read] for read in se_reads),
+			"R1 trim": ", ".join(trimmed[read] for read in r1_reads),
+			"R2 trim": ", ".join(trimmed[read] for read in r2_reads),
+		}
+		
 		# Trimming commands
-		trimming_commands = []
-		for idx, se_read in enumerate(se_reads, start=1):
-			se_trimmed = f"{config['trimmed']}/{bs}.SE{idx}.trimmed.fastq.gz"
-			cmd = f"cutadapt --trim-n --quality-base 33 --max-n 0.5 -m 30 --quality-cutoff 20 -o {se_trimmed} {se_read} --quiet -Z"
-			trimming_commands.append(cmd)
-
-		for idx, (r1_read, r2_read) in enumerate(zip(r1_reads, r2_reads), start=1):
-			r1_trimmed = f"{config['trimmed']}/{bs}.PE{idx}.R1.trimmed.fastq.gz"
-			r2_trimmed = f"{config['trimmed']}/{bs}.PE{idx}.R2.trimmed.fastq.gz"
-			cmd = f"cutadapt --trim-n --quality-base 33 --max-n 0.5 -m 30 --quality-cutoff 20 -o {r1_trimmed} -p {r2_trimmed} {r1_read} {r2_read} --quiet -Z"
-			trimming_commands.append(cmd)
+		trimming_commands = [
+			f"cutadapt --trim-n --quality-base 33 --max-n 0.5 -m 30 --quality-cutoff 20 "
+			f"-o {trimmed[se_read]} {raw[se_read]} --quiet -Z"
+			for se_read in se_reads
+		] + [
+			f"cutadapt --trim-n --quality-base 33 --max-n 0.5 -m 30 --quality-cutoff 20 "
+			f"-o {trimmed[r1_read]} -p {trimmed[r2_read]} {raw[r1_read]} {raw[r2_read]} --quiet -Z"
+			for r1_read, r2_read in zip(r1_reads, r2_reads)
+		]
 		
-		
+		data["trim"] = ' && '.join(trimming_commands)
 		
 		# Assembly command
-		spades_output = f"{config['denovo']}/{bs}_refguided_denovo"
-		spades_log = f"{config['denovo']}/{bs}.spades.log"
-		spades_err = f"{config['denovo']}/{bs}.spades.err"
-		se_trimmed_reads = " ".join([f"{config['trimmed']}/{bs}.SE{idx}.trimmed.fastq.gz" for idx in range(1, len(se_reads) + 1)])
-		pe_r1_trimmed_reads = " ".join([f"{config['trimmed']}/{bs}.PE{idx}.R1.trimmed.fastq.gz" for idx in range(1, len(r1_reads) + 1)])
-		pe_r2_trimmed_reads = " ".join([f"{config['trimmed']}/{bs}.PE{idx}.R2.trimmed.fastq.gz" for idx in range(1, len(r2_reads) + 1)])
-		assembly_cmd = (
-			f"spades.py -o {spades_output} "
-			+ (f"-1 {pe_r1_trimmed_reads} " if pe_r1_trimmed_reads else "")
-			+ (f"-2 {pe_r2_trimmed_reads} " if pe_r2_trimmed_reads else "")
-			+ (f"-s {se_trimmed_reads} " if se_trimmed_reads else "")
-			+ f"--untrusted-contigs {config['reference']} "
-			+ f"> {spades_log} 2> {spades_err}"
+		spades_output = os.path.join(config['denovo'], f"{bs}.{run_acc}_denovo")
+		spades_log = os.path.join(config['denovo'], f"{bs}.{run_acc}.spades.log")
+		spades_err = os.path.join(config['denovo'], f"{bs}.{run_acc}.spades.err")
+		se_trimmed_reads = " ".join(trimmed[read] for read in se_reads)
+		r1_trimmed_reads = " ".join(trimmed[read] for read in r1_reads)
+		r2_trimmed_reads = " ".join(trimmed[read] for read in r2_reads)
+		data["spades"] = (
+			f"spades.py -t 1 -o {spades_output} "
+			+ (f"-1 {r1_trimmed_reads} " if r1_reads else "")
+			+ (f"-2 {r2_trimmed_reads} " if r2_reads else "")
+			+ (f"-s {se_trimmed_reads} " if se_reads else "")
+			+ f"--untrusted-contigs {config['reference']} > {spades_log} 2> {spades_err}"
 		)
-		combined_cmd = f"{' && '.join(trimming_commands)} && {assembly_cmd}"
-		commands.append(combined_cmd)
+		datarows[run_acc] = data
+		
+	with open(outfile, "w") as g:
+		wtr = csv.DictWriter(g, fieldnames=header, delimiter="\t")
+		wtr.writeheader()
+		
+		for row in datarows.values():
+			# Fill missing fields with empty strings
+			complete_row = {field: row.get(field, "") for field in header}
+			wtr.writerow(complete_row)
+	
+	msg(f"Ready with {outfile}")
 
-	return commands
 
-def write_commands(commands,commands_file):
-	with open(commands_file, "w") as cmd_file:
-		for cmd in commands:
-			cmd_file.write(f"{cmd}\n")
-	print(f"Assembly commands written to {commands_file}")
+def check_set_of_fq(sample, se, r1, r2):
+	"""
+	Check the integrity of a set of FASTQ files and ensure all required files are present.
+
+	:param sample: Sample name for logging.
+	:param se: Path to single-end FASTQ file.
+	:param r1: Path to paired-end R1 FASTQ file.
+	:param r2: Path to paired-end R2 FASTQ file.
+	:return: True if all files are valid; False otherwise.
+	"""
+	files = {"SE": se, "R1": r1, "R2": r2}
+	missing_files = [name for name, fq in files.items() if fq and not os.path.isfile(fq)]
+	corrupt_files = [name for name, fq in files.items() if fq and os.path.isfile(fq) and not check_gz_integrity(fq)]
+
+	# Log missing files
+	if missing_files:
+		error(f"{sample}: Missing files: {', '.join(missing_files)}\n")
+
+	# Log corrupt files
+	if corrupt_files:
+		error(f"{sample}: Corrupt files: {', '.join(corrupt_files)}\n")
+
+	# Return False if any issues were found
+	if missing_files or corrupt_files:
+		return False
+
+	# Ensure paired-end files are correctly paired
+	if (r1 and not r2) or (r2 and not r1):
+		error(f"{sample}: Missing one of the paired-end files (R1 or R2)\n")
+		return False
+
+	# Ensure at least one valid file is present
+	if not (se or (r1 and r2)):
+		error(f"{sample}: No valid FASTQ files provided")
+		return False
+
+	return True
+
+def collect_scaffolds(sample, assembly, denovo_path):
+	"""
+	Collect and filter scaffolds for a given sample based on length and coverage criteria.
+
+	:param sample: Name of the sample.
+	:param assembly: Path to the final assembly file.
+	:param denovo_path: Path to the SPAdes denovo directory.
+	:return: True if the assembly file is successfully created or already exists.
+	"""
+	msg(f"Collecting scaffolds for {sample}")
+	
+	# Paths for scaffolds and filtered list
+	scaffolds_source = os.path.join(denovo_path,"scaffolds.fasta")
+	scaffolds = f"{os.path.join(config['denovo'],sample)}_scaffolds.fasta"
+	filterlist = f"{os.path.join(config['denovo'],sample)}_scaffolds.filtered.list"
+	
+	# Handle gzipped assembly
+	gz = False
+	if assembly.endswith(".gz"):
+		gz = True
+		assembly = assembly.rsplit(".", 1)[0]  # Remove ".gz" extension for processing
+	
+	# Ensure scaffolds file exists
+	if not os.path.isfile(scaffolds):
+		if os.path.isfile(scaffolds_source):
+			shutil.copy(scaffolds_source,scaffolds)
+			msg(f"{sample}: Scaffolds copied from {scaffolds_source}")
+		else:
+			error(f"{sample}: Scaffolds source missing at {scaffolds_source}")
+			return False
+	
+	# Extract scaffold sequence names
+	sequences = get_fa_names(scaffolds)
+	if not sequences:
+		error(f"{sample}: No sequences found in {scaffolds}")
+		return False
+	
+	# Filter scaffolds based on length and coverage
+	with open(filterlist,"w") as g:
+		filtered_count = 0
+		for seqname in sequences:
+			block = seqname.split("_")
+			if len(block) < 6:
+				msg(f"{sample}: Invalid sequence name format: {seqname}")
+				continue
+			
+			length = int(block[3])
+			cov = float(block[5])
+			if length >= config['minlen'] and cov >= config['mincov']:
+				g.write(f"{seqname}\n")
+				filtered_count += 1
+	
+	msg(f"{sample}: {filtered_count} contigs passed the filter.")
+	
+	# Create filtered assembly
+	sysexec(f"seqtk subseq {scaffolds} {filterlist} > {assembly}")
+	if gz:
+		sysexec(f"gzip -f {assembly}")
+		msg(f"{sample}: Gzipped assembly created at {assembly}.gz")
+		
+	else:
+		msg(f"{sample}: assembly created at {assembly}")
+	
+	return True
+
+def count_reads_and_bases(fastq):
+	"""Count the number of reads and total nucleotides in a FASTQ file."""
+	if not fastq or not os.path.isfile(fastq):
+		return 0, 0
+	cmd = f"zcat {fastq} | awk 'NR % 4 == 2' | awk '{{total += length($0); count++}} END {{print count, total}}'"
+	try:
+		count, total_bases = map(int, subprocess.check_output(cmd, shell=True).strip().split())
+		return count, total_bases
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Error reading {fastq}: {e}")
+		return 0, 0
+
+def count_contigs(fasta):
+	"""Count the number of contigs and their total size in a gzipped FASTA file."""
+	if not fasta or not os.path.isfile(fasta):
+		return 0, 0
+	cmd = f"zcat {fasta} | awk '/^>/ {{if (seqlen) print seqlen; seqlen=0; next;}} {{seqlen += length($0);}} END {{if (seqlen) print seqlen;}}'"
+	try:
+		contig_lengths = list(map(int, subprocess.check_output(cmd, shell=True).strip().split()))
+		return len(contig_lengths), sum(contig_lengths)
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Error reading {fasta}: {e}")
+		return 0, 0
+
+def count_n_bases(fasta):
+	"""Count the number of 'N' bases in a gzipped FASTA file."""
+	if not fasta or not os.path.isfile(fasta):
+		return 0
+	cmd = f"zcat {fasta} | grep -v '^>' | tr -cd 'Nn' | wc -c"
+	try:
+		return int(subprocess.check_output(cmd, shell=True).strip())
+	except subprocess.CalledProcessError as e:
+		logging.error(f"Error reading {fasta}: {e}")
+		return 0
+
+
+def trim_and_assembly(row):
+	"""
+	Process trimming, assembly, and statistics generation for a given BioSample and Run.
+	"""
+	# Define paths
+	sample = f"{row['BioSample']}.{row['Run']}"
+	assembly = os.path.join(config['assemblies'], f"{sample}.fna.gz")
+	denovo_path = os.path.join(config['denovo'], f"{sample}_denovo")
+	statfile = os.path.join(config['stats'], f"{sample}.stats.tsv")
+
+	# Step 1: Check if assembly exists and is not corrupt
+	if os.path.isfile(assembly) and check_gz_integrity(assembly):
+		msg(f"{assembly} is ready, skipping processing.")
+	else:
+		# Step 2: Download raw reads if necessary
+		download_raw_reads(row, sample)
+
+		# Step 3: Trim raw reads if necessary
+		if not trim_reads(row, sample):
+			return  # Skip if trimming fails
+
+		# Step 4: Perform assembly using SPAdes if necessary
+		if not perform_assembly(row, sample, denovo_path):
+			return  # Skip if assembly fails
+
+		# Step 5: Filter contigs
+		msg(f"{sample}: Filtering contigs...")
+		collect_scaffolds(sample, assembly, denovo_path)
+
+		# Step 6: Generate statistics
+		generate_statistics(row, sample, assembly, statfile)
+
+	# Step 7: Remove intermediate files
+	cleanup_intermediate_files(row, assembly, denovo_path, deletion=True)
+
+	msg(f"{sample}: Processing complete.")
+
+
+def download_raw_reads(row, sample):
+	"""Download raw reads if they do not exist."""
+	if not all(not item or (item and os.path.isfile(item)) for item in [row["SE"], row["R1"], row["R2"]]):
+		msg(f"{sample}: Downloading raw reads...")
+		for item in row['fastq_ftp'].split(";"):
+			outfile = os.path.join(config['raw_reads'], os.path.basename(item))
+			if not os.path.isfile(outfile):
+				download_file(item, outfile)
+	else:
+		msg(f"{sample}: Raw reads are already downloaded.")
+
+
+def trim_reads(row, sample):
+	"""Trim raw reads if they are not already trimmed."""
+	if not all(not item or (item and os.path.isfile(item)) for item in [row["SE trim"], row["R1 trim"], row["R2 trim"]]):
+		msg(f"{sample}: Checking and trimming raw reads...")
+		if not check_set_of_fq(row["Run"], row["SE"], row["R1"], row["R2"]):
+			error(f"{sample}: Invalid raw fastq files, skipping...")
+			return False
+		msg(f"{sample}: Performing trimming...")
+		sysexec(row["trim"])
+	else:
+		msg(f"{sample}: Reads are already trimmed.")
+	return True
+
+
+def perform_assembly(row, sample, denovo_path):
+	"""Run SPAdes assembly if not already done."""
+	scaffolds_path = os.path.join(denovo_path, "scaffolds.fasta")
+	if os.path.isfile(scaffolds_path):
+		msg(f"{sample}: Assembly already completed, skipping SPAdes.")
+		return True
+
+	msg(f"{sample}: Verifying trimmed reads...")
+	if not check_set_of_fq(f"{row['Run']} (trimmed)", row["SE trim"], row["R1 trim"], row["R2 trim"]):
+		error(f"{sample}: Invalid trimmed files, skipping...")
+		return False
+
+	msg(f"{sample}: Running SPAdes...")
+	sysexec(row["spades"])
+	return True
+
+
+def generate_statistics(row, sample, assembly, statfile):
+	"""Generate statistics for trimming and assembly."""
+	msg(f"{sample}: Generating statistics...")
+	stats = OrderedDict([
+		("Run", row["Run"]),
+		("BioSample", row["BioSample"]),
+		("SE Reads Before Trimming", 0),
+		("R1 Reads Before Trimming", 0),
+		("R2 Reads Before Trimming", 0),
+		("SE Reads After Trimming", 0),
+		("R1 Reads After Trimming", 0),
+		("R2 Reads After Trimming", 0),
+		("Total Nucleotides Before Trimming", 0),
+		("Total Nucleotides After Trimming", 0),
+		("Percentage of Kept Nucleotides", 0),
+		("N Count", 0),
+		("Contig Number", 0),
+		("Genome Size", 0),
+		("Average Coverage", 0),
+	])
+
+	# Populate read counts and nucleotide statistics
+	for fq, key_reads, key_bases in [
+		(row["SE"], "SE Reads Before Trimming", "Total Nucleotides Before Trimming"),
+		(row["R1"], "R1 Reads Before Trimming", "Total Nucleotides Before Trimming"),
+		(row["R2"], "R2 Reads Before Trimming", "Total Nucleotides Before Trimming"),
+		(row["SE trim"], "SE Reads After Trimming", "Total Nucleotides After Trimming"),
+		(row["R1 trim"], "R1 Reads After Trimming", "Total Nucleotides After Trimming"),
+		(row["R2 trim"], "R2 Reads After Trimming", "Total Nucleotides After Trimming"),
+	]:
+		read_count, total_bases = count_reads_and_bases(fq)
+		stats[key_reads] += read_count
+		stats[key_bases] += total_bases
+
+	# Calculate percentages and other statistics
+	if stats["Total Nucleotides Before Trimming"] > 0:
+		stats["Percentage of Kept Nucleotides"] = round(
+			100 * stats["Total Nucleotides After Trimming"] / stats["Total Nucleotides Before Trimming"], 2
+		)
+	if os.path.isfile(assembly):
+		stats["Contig Number"], stats["Genome Size"] = count_contigs(assembly)
+		stats["N Count"] = count_n_bases(assembly)
+		if stats["Genome Size"] > 0:
+			stats["Average Coverage"] = stats["Total Nucleotides After Trimming"] / stats["Genome Size"]
+
+	# Write statistics to a TSV file
+	with open(statfile, "w", newline="") as tsvfile:
+		writer = csv.DictWriter(tsvfile, fieldnames=stats.keys(), delimiter="\t")
+		writer.writeheader()
+		writer.writerow(stats)
+	msg(f"{sample}: Statistics written to {statfile}.")
+
+
+def cleanup_intermediate_files(row, assembly, denovo_path, deletion=False):
+	"""Delete intermediate files if the assembly exists and is valid."""
+	deleted_files = []
+	for item in [row["SE"], row["R1"], row["R2"], row["SE trim"], row["R1 trim"], row["R2 trim"]]:
+		if item and os.path.isfile(item):
+			if deletion:
+				os.remove(item)
+			deleted_files.append(item)
+	if os.path.isdir(denovo_path):
+		if deletion:
+			shutil.rmtree(denovo_path)
+		deleted_files.append(denovo_path)
+	if deleted_files:
+		msg(f"Deleted intermediate files: {', '.join(deleted_files)}")
+
+
+def process_row_with_progress(row, progress_counter, active_counter, total_rows):
+	"""
+	Process a single row and update progress counters.
+
+	:param row: The data row to process.
+	:param progress_counter: Shared counter for completed samples.
+	:param active_counter: Shared counter for currently active samples.
+	:param total_rows: Total number of rows to process.
+	"""
+	# Increment the active counter
+	active_counter.value += 1
+
+	# Print progress
+	print(
+		f"Processed: {progress_counter.value}, "
+		f"Processing: {active_counter.value}, "
+		f"Remaining: {total_rows - progress_counter.value - active_counter.value}",
+		end="\r"
+	)
+
+	# Perform the processing
+	trim_and_assembly(row)
+
+	# Update counters after processing
+	active_counter.value -= 1
+	progress_counter.value += 1
+
+	# Print updated progress
+	print(
+		f"Processed: {progress_counter.value}, "
+		f"Processing: {active_counter.value}, "
+		f"Remaining: {total_rows - progress_counter.value - active_counter.value}",
+		end="\r"
+	)
 
 
 
+def run_trim_and_assembly_for_all_samples(commands):
+	"""
+	Run trimming and assembly for all samples using multiprocessing.
+
+	:param commands: Path to the commands TSV file.
+	"""
+	# Step 1: Create required directories
+	for item in ['trimmed', 'denovo', 'assemblies', 'stats']:
+		mkdir_force(config[item])
+
+	# Step 2: Load commands from the TSV file
+	with open(commands, "r") as f:
+		reader = csv.DictReader(f, delimiter="\t")
+		rows = list(reader)
+
+	total_rows = len(rows)
+
+	# Step 3: Set up multiprocessing.Manager to manage shared state
+	with mp.Manager() as manager:
+		progress_counter = manager.Value('i', 0)  # Shared counter for completed samples
+		active_counter = manager.Value('i', 0)    # Shared counter for currently active samples
+
+		# Step 4: Run trim_and_assembly in parallel
+		with mp.Pool(pargs.n) as pool:  # pargs.n specifies the number of processes
+			pool.starmap(
+				process_row_with_progress,
+				[(row, progress_counter, active_counter, total_rows) for row in rows]
+			)
+
+	# Step 5: Final message
+	info("Assembly completed for all samples.")
+
+	
+	
 def main():
 	"""Main execution flow"""
 	global config
+	global pargs
 	pargs = get_pargs()
 	config = define_config()
 	
@@ -825,17 +1230,16 @@ def main():
 	
 	filter_and_transform_genomes(config['urinary'], config["urinary_with_dates_and_locations"])
 	
-	
-	
 	fetch_read_identifiers(config["urinary_with_dates_and_locations"])
 	concat_batches(config["urinary_with_dates_and_locations"], config['urinary_reads'])
 	#
-	download_reads(config['urinary_reads'], config["urinary_with_dates_and_locations"])
+	####download_reads(config['urinary_reads'], config["urinary_with_dates_and_locations"], config["raw_reads"])
 	#
-	#!get_reference_genome()
+	get_reference_genome()
 	#
-	#commands = prepare_assembly_commands(config["urinary_with_dates_and_locations"], config['urinary_reads'])
-	#write_commands(commands,"assembly_commands.sh")
+	commands = prepare_assembly_commands(config["urinary_with_dates_and_locations"], config['urinary_reads'], config['commands'])
+	#This is the part for trimming and assembly
+	run_trim_and_assembly_for_all_samples(config['commands'])
 
 
 
