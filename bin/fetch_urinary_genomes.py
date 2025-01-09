@@ -1,10 +1,12 @@
 #!/usr/bin/python3
 '''Automatically downloading all genomes belonging to a certain species from NCBI refseq and genbank databases
 '''
+#docker: klebsiella
 
 #TODO: download should be moved to the process_sample part
 
 import csv
+import glob
 import re
 import os
 import argparse
@@ -21,6 +23,7 @@ import shutil
 import logging
 from itertools import chain
 import subprocess
+from pathlib import Path
 
 #Utility functions
 
@@ -160,6 +163,7 @@ def define_config():
 		"reference": "Reference/GCF_000005845.2.fa",
 		"reference_link": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz",
 		"denovo": "Intermediate_files/Denovo",
+		"fasterq": "Intermediate_files/Fasterq_dump",
 		"assemblies": "Assemblies",
 		"stats": "Statistics",
 		"raw_reads": "Raw_reads",
@@ -556,6 +560,7 @@ def download_file(link, output_path):
 		link = f"https://{link}"
 	msg(f"Downloading {link} to {output_path}...")
 	try:
+		time.sleep(1)
 		response = requests.get(link, stream=True)
 		response.raise_for_status()
 		with open(temp_path, "wb") as temp_file:
@@ -984,13 +989,13 @@ def trim_and_assembly(row):
 	assembly = os.path.join(config['assemblies'], f"{sample}.fna.gz")
 	denovo_path = os.path.join(config['denovo'], f"{sample}_denovo")
 	statfile = os.path.join(config['stats'], f"{sample}.stats.tsv")
-
 	# Step 1: Check if assembly exists and is not corrupt
 	if os.path.isfile(assembly) and check_gz_integrity(assembly):
 		msg(f"{assembly} is ready, skipping processing.")
 	else:
 		# Step 2: Download raw reads if necessary
-		download_raw_reads(row, sample)
+		if not download_raw_reads(row, sample):
+			return
 
 		# Step 3: Trim raw reads if necessary
 		if not trim_reads(row, sample):
@@ -1002,12 +1007,13 @@ def trim_and_assembly(row):
 
 		# Step 5: Filter contigs
 		msg(f"{sample}: Filtering contigs...")
-		collect_scaffolds(sample, assembly, denovo_path)
+		if not collect_scaffolds(sample, assembly, denovo_path):
+			return #Break if we fail at this point
 
 		# Step 6: Generate statistics
 		generate_statistics(row, sample, assembly, statfile)
 
-	# Step 7: Remove intermediate files
+	# Step 7: Remove intermediate files - only if everything was successful
 	cleanup_intermediate_files(row, assembly, denovo_path, deletion=True)
 
 	msg(f"{sample}: Processing complete.")
@@ -1015,14 +1021,26 @@ def trim_and_assembly(row):
 
 def download_raw_reads(row, sample):
 	"""Download raw reads if they do not exist."""
-	if not all(not item or (item and os.path.isfile(item)) for item in [row["SE"], row["R1"], row["R2"]]):
-		msg(f"{sample}: Downloading raw reads...")
-		for item in row['fastq_ftp'].split(";"):
-			outfile = os.path.join(config['raw_reads'], os.path.basename(item))
-			if not os.path.isfile(outfile):
-				download_file(item, outfile)
-	else:
+	msg(f"Downloading {sample}")
+	status = {item: not item or (item and os.path.isfile(item) and check_gz_integrity(item)) for item in [row["SE"], row["R1"], row["R2"]]}
+	if all(status):
 		msg(f"{sample}: Raw reads are already downloaded.")
+		return True
+	else:
+		msg(f"{sample}: Downloading raw reads...")
+		print(f"fasterq-dump {row['Run']} -q -t {config['fasterq']} -o {config['fasterq']} -m 1GB")
+		exit()
+		for item in [row['SE'], row['R1'], row['R2']]:
+			if item:
+				if os.path.isfile(source := os.path.join(config['fasterq'], Path(item).stem)):
+					sysexec(f"gzip -f {source}")
+					shutil.copy(f"{source}.gz", item)
+	for item in [row["SE"], row["R1"], row["R2"]]:
+		status[item] = not item or (item and os.path.isfile(item) and check_gz_integrity(item))
+	if not all([status[item] for item in [row["SE"], row["R1"], row["R2"]]]):
+		msg(f"{sample}: Error with downloading, missing files")
+		return False
+		
 
 
 def trim_reads(row, sample):
@@ -1112,7 +1130,9 @@ def generate_statistics(row, sample, assembly, statfile):
 def cleanup_intermediate_files(row, assembly, denovo_path, deletion=False):
 	"""Delete intermediate files if the assembly exists and is valid."""
 	deleted_files = []
-	for item in [row["SE"], row["R1"], row["R2"], row["SE trim"], row["R1 trim"], row["R2 trim"]]:
+	spades_log = os.path.join(config['denovo'], f"{row['BioSample']}.{row['Run']}.spades.log")
+	spades_err = os.path.join(config['denovo'], f"{row['BioSample']}.{row['Run']}.spades.err")
+	for item in [row["SE"], row["R1"], row["R2"], row["SE trim"], row["R1 trim"], row["R2 trim"], spades_err, spades_log]:
 		if item and os.path.isfile(item):
 			if deletion:
 				os.remove(item)
@@ -1122,7 +1142,7 @@ def cleanup_intermediate_files(row, assembly, denovo_path, deletion=False):
 			shutil.rmtree(denovo_path)
 		deleted_files.append(denovo_path)
 	if deleted_files:
-		msg(f"Deleted intermediate files: {', '.join(deleted_files)}")
+		msg(f"{row['BioSample']}.{row['Run']}: Deleted intermediate files: {', '.join(deleted_files)}")
 
 
 def process_row_with_progress(row, progress_counter, active_counter, total_rows):
@@ -1169,16 +1189,22 @@ def run_trim_and_assembly_for_all_samples(commands):
 	:param commands: Path to the commands TSV file.
 	"""
 	# Step 1: Create required directories
-	for item in ['trimmed', 'denovo', 'assemblies', 'stats']:
+	for item in ['trimmed', 'denovo', 'assemblies', 'stats', 'fasterq']:
 		mkdir_force(config[item])
-
+		
+	assembled_genomes = [os.path.basename(x) for x in glob.glob(os.path.join(config['assemblies'],"*.fna.gz"))]
+	
 	# Step 2: Load commands from the TSV file
 	with open(commands, "r") as f:
 		reader = csv.DictReader(f, delimiter="\t")
-		rows = list(reader)
+		rows = [row for row in reader if f"{row['BioSample']}.{row['Run']}.fna.gz" not in assembled_genomes]
 
 	total_rows = len(rows)
-
+	msg(f"Processing {total_rows} genomes", onscreen=True)
+	
+	##for row in rows:
+	##	trim_and_assembly(row)
+	##	exit()
 	# Step 3: Set up multiprocessing.Manager to manage shared state
 	with mp.Manager() as manager:
 		progress_counter = manager.Value('i', 0)  # Shared counter for completed samples
