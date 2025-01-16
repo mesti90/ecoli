@@ -1,10 +1,11 @@
 #!/usr/bin/python3
 '''Automatically downloading all genomes belonging to a certain species from NCBI refseq and genbank databases
 '''
-#docker: klebsiella
+#docker: hgttree ?? klebsiella ??
 
-#TODO: download should be moved to the process_sample part
+###ATB: downloaded by Gabor Grezal and copied from /node8_R10/grezal/allTheBacteria/atb/metadata/E_coli_hq_GG.tsv to: Metadata/atb.E_coli_hq_GG.tsv
 
+###Pathogens: downloaded manually from  https://www.ncbi.nlm.nih.gov/pathogens/isolates/#taxgroup_name:%22E.coli%20and%20Shigella%22 to: Metadata/pathogens.E.coli_and_Shigella_NCBI_pathogenes.tsv
 import csv
 import glob
 import re
@@ -24,13 +25,13 @@ import logging
 from itertools import chain
 import subprocess
 from pathlib import Path
-
+import matplotlib.pyplot as plt
 #Utility functions
 
 def get_pargs():
 	"""Parse command-line arguments for the script."""
 	parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-	parser.add_argument("-n",help="Number of threads",default=20,type=int)
+	parser.add_argument("-n",help="Number of threads",default=30,type=int)
 	parser.add_argument("-gd",help="Directory of genomes",default="Genomes")
 	return parser.parse_args()
 
@@ -126,8 +127,8 @@ def load_or_create_feather(input_file, feather_file, sep="\t"):
 	else:
 		msg(f"Reading DataFrame from CSV: {input_file}")
 		df = pd.read_csv(input_file, sep=sep, low_memory=False, engine="c", dtype=str)
-		msg(f"Saving DataFrame to Feather: {feather_file}")
-		df.to_feather(feather_file)
+		#msg(f"Saving DataFrame to Feather: {feather_file}")
+		#df.to_feather(feather_file)
 	return df
 
 #Main functions
@@ -147,6 +148,7 @@ def define_config():
 		**{f"{key}": bases[key] + subcategories["assembly_summary"] for key in bases},
 		**{f"{key}_{sub}": bases[key] + subcategories[sub] for key in bases for sub in ["ecoli", "biosample"]},
 		"databases": ["pathogens", "refseq", "genbank", "atb"],
+		"geolocations": "Metadata/ncbi_geographic_locations.tsv",
 		"species": "Escherichia coli",
 		"atb": "Metadata/atb.E_coli_hq_GG.tsv",
 		"pathogens": "Metadata/pathogens.E.coli_and_Shigella_NCBI_pathogenes.tsv",
@@ -157,9 +159,13 @@ def define_config():
 		"biosample_metadata_log": "Metadata/biosamples.metadata_from_ncbi.log",
 		"pathogens_urinary": "Metadata/urinary.pathogens.tsv",
 		"biosample_urinary": "Metadata/urinary.biosamples.tsv",
-		"urinary": "Metadata/urinary.genomes.tsv",
-		'urinary_reads': "Metadata/urinary.genomes.readlinks.tsv",
-		"urinary_with_dates_and_locations": "Metadata/urinary.genomes.dates_and_locations.tsv",
+		"urinary": "Metadata/urinary.biosamples.tsv",
+		"urinary_full": "Metadata/urinary.biosamples.all_genomes.with_all_metadata.tsv",
+		'urinary_reads': "Metadata/urinary.biosamples.readlinks.tsv",
+		"urinary_with_dates_and_locations": "Metadata/urinary.selected_genomes.nonempty_dates_and_locations.tsv",
+		"urinary_per_country": "Metadata/genome_count_per_country.tsv",
+		"urinary_per_year": "Metadata/genome_count_per_year.pdf",
+		"urinary_per_keyword": "Metadata/genome_count_per_keyword.tsv",
 		"reference": "Reference/GCF_000005845.2.fa",
 		"reference_link": "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz",
 		"denovo": "Intermediate_files/Denovo",
@@ -171,6 +177,7 @@ def define_config():
 		"commands": "Metadata/assembly_commands.tsv",
 		'minlen': 1000,
 		'mincov': 10,
+		'urine_keywords': ['CAUTI', 'UPEC', 'UTI', 'bladder', 'catheter', 'cystitis', 'genitourinary', 'kidney', 'nephritis', 'nephron', 'periurethral', 'prostatitis', 'pyelonephritis', 'pyrexia', 'renal', 'superficial facet cells', 'tubular epithelial', 'umbrella cells', 'ureter', 'urethra', 'urethral', 'uretra', 'uriine', 'urikult', 'urinary', 'urination', 'urine', 'uroepithelial', 'uroepithelium', 'urogenital', 'uropathogenic', 'uroplakin']
 	}
 	return config
 
@@ -208,7 +215,9 @@ def get_biosamples_table(summary,output,column,header=True):
 	with open(summary) as f:
 		rdr = csv.reader(f, delimiter="\t")
 		if header:
-			next(rdr)
+			myheader = next(rdr)
+			if "BioSample" in myheader:
+				column = myheader.index("BioSample")
 		biosamples = set(row[column] for row in rdr)
 	with open(output, "w") as g:
 		for bs in biosamples:
@@ -232,7 +241,7 @@ def merge_biosamples(databases, output):
 	
 	# Write merged biosample table
 	with open(output,"w") as g:
-		wtr = csv.DictWriter(g,delimiter="\t", fieldnames = ["BioSample"] + databases + ["selected_database"])
+		wtr = csv.DictWriter(g,delimiter="\t", fieldnames = ["BioSample"] + databases)
 		wtr.writeheader()
 		for bs in sorted(all_biosamples):
 			row = {db: (1 if bs in biosample_data[db] else 0)  for db in databases}
@@ -250,40 +259,34 @@ def get_urinary_pathogens(fname, output_file):
 	:param fname: Input file name (tab-delimited).
 	:param output_file: Output file name for filtered results.
 	"""
-	if os.path.isfile(output_file):
-		info(f"I refuse to overwrite {output_file}, skipping filtering of pathogens")
-		return
+	#!if os.path.isfile(output_file):
+	#!	info(f"I refuse to overwrite {output_file}, skipping filtering of pathogens")
+	#!	return
 	info(f"Get urinary related genomes from {fname}")
 	try:
 		with open(fname, "r", newline="", encoding="utf-8") as infile, open(output_file, "w", newline="", encoding="utf-8") as outfile:
-			reader = csv.reader(infile, delimiter="\t")
+			reader = csv.DictReader(infile, delimiter="\t")
 			writer = csv.writer(outfile, delimiter="\t")
-			
-			# Read the header and find the BioSample column index
-			header = next(reader)
-			biosample_index = header.index("BioSample") if "BioSample" in header else None
-			
-			if biosample_index is None:
-				raise ValueError("BioSample column not found in the input file header.")
-			
-			# Move the BioSample column to the first position in the header
-			reordered_header = [header[biosample_index]] + header[:biosample_index] + header[biosample_index+1:]
-			writer.writerow(reordered_header)
 			
 			# Filter rows based on conditions and reorder columns
 			for row in reader:
+				joined_row = " ".join(row)
 				if (
-					row[31] != "" and  # Column 32 is not empty
-					re.search(r"uri(i?)ne|urinary|uret(h?)ra|urikult|urogenital|bladder|kidney", row[7], re.IGNORECASE) and  # Column 8 matches urinary-related terms
-					not re.search(r"can(i|u|iu)s|canine|felis|feline|llama|dolphin|beef|bovine", row[7], re.IGNORECASE) and  # Column 8 does not match animal-related terms
-					re.match(r"^homo|^hu|^\"homo", row[20], re.IGNORECASE) and  # Column 21 matches human-related terms
-					row[48] == "562"  # Column 49 equals 562
+					row["Species TaxID"] == "562"  # Species TaxID refers to E. coli
+					and
+					re.match(r"^homo|^hu|^\"homo", row["Host"], re.IGNORECASE) and  # Host matches human-related terms
+					row["BioSample"] # it's not empty
+					and
+					row["Run"] # there are reads in the SRA database
+					and
+					re.search(r"uri(i?)ne|urinary|uret(h?)ra|urikult|urogenital|bladder|kidney", joined_row, re.IGNORECASE) # urinary-related are in the row
+					and
+					not re.search(r"can(i|u|iu)s|canine|felis|feline|llama|dolphin|beef|bovine", joined_row, re.IGNORECASE)  # no animal-related terms found in the row
 				):
 					# Move the BioSample column to the first position in the row
-					reordered_row = [row[biosample_index]] + row[:biosample_index] + row[biosample_index+1:]
-					writer.writerow(reordered_row)
+					writer.writerow(row)
 		
-		print(f"Filtered results with reordered columns saved to {output_file}")
+		print(f"Filtered results from pathogens were saved to {output_file}")
 	except Exception as e:
 		print(f"Error processing file: {e}")
 
@@ -361,7 +364,7 @@ def get_urinary_biosamples(input_file, output_file):
 	columns_to_select = ["BioSample", "collection date", "geographic location",  "isolation source", "strain", "source type", "host", "host description", "host disease", "host disease outcome", "study disease", "serotype", "pathotype", "environmental sample", "sample type", "Entry notes"]
 	
 	#Keywords for filtering"
-	keywords = [x.lower() for x in ["CAUTI", "periurethral", "uroepithelium", "uroepithelial", "renal", "tubular epithelial", "umbrella cells", "superficial facet cells", "uroplakin", "uropathogenic", "ureter", "urination", "prostatitis", "pyelonephritis", "pyrexia", "Genitourinary", "Urinary", "Urine", "UTI", "Bladder", "Cystitis", "Catheter", "UPEC", "kidney", "urethra", "urethral", "nephron", "Nephritis"]]
+	keywords = [x.lower() for x in config['urine_keywords']]
 	human_keywords = [x.lower() for x in ["Homo", "homo", "human"]]
 	
 	df = load_or_create_feather(input_file, f"{input_file}.feather")
@@ -407,38 +410,133 @@ def get_urinary_biosamples(input_file, output_file):
 	final_df.to_csv(output_file, index=False, sep="\t")
 	info(f"Filtered results written to {output_file}")
 
-def merge_pathogens_and_biosample_metadata(pathogens_file, biosamples_file, biosample_sources, output_file):
+def validate_date(x):
+	invalid_dates = ["0000", "Missing", "not applicable", "Not applicable","not collected", "not provided", "unknown", "Unknown"]
+	return x if (pd.notna(x) and x not in invalid_dates and not "/" in x and x.isdigit() and int(x) >= 1950) else None
+
+
+def validate_geo(x):
+	invalid_locations = ["", "unknown", "Unknown"]
+	return x if (pd.notna(x) and x not in invalid_locations) else None
+
+def merge_pathogens_and_biosample_metadata(urinary_genomes, biosample_sources, pathogen_metadata, geographic_locations, output_file_full, output_file_filtered):
 	"""Merge tables by the 'BioSample' column and add prefixes to distinguish column origins."""
-	if os.path.isfile(output_file):
-		info(f"{output_file} is ready, skip merging")
+	if os.path.isfile(output_file_full) and os.path.isfile(output_file_filtered):
+		info(f"{output_file_full} and {output_file_filtered} are ready, skip merging")
 		return
-	info(f"Merging {pathogens_file} and {biosamples_file}")
-	# Read the tables
-	pathogens_df = pd.read_csv(pathogens_file, sep="\t", dtype=str)
-	biosamples_df = pd.read_csv(biosamples_file, sep="\t", dtype=str)
+	info(f"Add data to {urinary_genomes}")
+	
+	#Read the tables
+	main_df = pd.read_csv(urinary_genomes, sep="\t", dtype=str).add_prefix("Biosamples|").rename(columns={"Biosamples|BioSample": "BioSample"})
+	pathogens_df = pd.read_csv(pathogen_metadata, sep="\t", dtype=str).add_prefix("Pathogens|").rename(columns={"Pathogens|BioSample": "BioSample"})
 	sources_df = pd.read_csv(biosample_sources, sep="\t", dtype=str)
+	geo_locations = pd.read_csv(geographic_locations,sep="\t").drop_duplicates(subset=["geographic_location", "region_and_locality"]).dropna(subset=["geographic_location", "region_and_locality"], how="all")
+	
+	main_df = pd.merge(main_df, pathogens_df, on="BioSample", how="left")
+	main_df = pd.merge(sources_df, main_df, on = "BioSample", how= "right")
+	main_df.columns = main_df.columns.str.replace(" ", "_")
+	
+	#ADJUST collection dates
+	main_df["Biosamples|collection_date"] = main_df["Biosamples|collection_date"].apply(lambda x: validate_date(x))	
+	main_df["Pathogens|Collection_date"] = main_df["Pathogens|Collection_date"].apply(lambda x: validate_date(x))
+	
+	main_df["collection_date"] = main_df.apply(
+		lambda row: row["Biosamples|collection_date"]
+		if pd.notna(row["Biosamples|collection_date"])
+		else row["Pathogens|Collection_date"]
+		if pd.notna(row["Pathogens|Collection_date"])
+		else None,
+		axis=1
+	).copy()
 	
 
-	# Add prefixes to column names (except 'BioSample')
-	pathogens_df = pathogens_df.add_prefix("Pathogens|")
-	biosamples_df = biosamples_df.add_prefix("Biosamples|")
+	#ADJUST geographic locations
+	main_df["Biosamples|geographic_location"] = main_df["Biosamples|geographic_location"].apply(lambda x: validate_geo(x))
+	# Process Pathogens|Location
+	main_df["Pathogens|Location"] = main_df["Pathogens|Location"].apply(lambda x: validate_geo(x))
+	main_df["geographic_location"] = main_df.apply(
+		lambda row: (
+			row["Biosamples|geographic_location"]
+			if pd.notna(row["Biosamples|geographic_location"])
+			else row["Pathogens|Location"]
+			if pd.notna(row["Pathogens|Location"])
+			else None
+		),
+		axis=1
+	).copy()
+	main_df["region_and_locality"] = main_df.pop("Biosamples|geographic_location_(region_and_locality)")
+	
+	main_df = pd.merge(main_df, geo_locations, on = ['geographic_location', 'region_and_locality'], how="left").copy()
+	
+	
+	
+	first_cols = ["BioSample","pathogens","refseq","genbank","atb","collection_date", "country", "city", "geographic_location", "region_and_locality"]
+	columns = first_cols + [col for col in main_df.columns if col not in first_cols]
+	main_df = main_df[columns]  # Reorder the DataFrame columns
+	main_df.fillna("",inplace=True)
+	# Drop columns where all values are empty strings
+	main_df = main_df.loc[:, ~(main_df == "").all()]
 
-	# Restore 'BioSample' column (it gets prefixed by add_prefix)
-	pathogens_df = pathogens_df.rename(columns={"Pathogens|BioSample": "BioSample"})
-	biosamples_df = biosamples_df.rename(columns={"Biosamples|BioSample": "BioSample"})
+	main_df.to_csv(output_file_full,sep="\t",index=False)
+	
+	info(f"{output_file_full} is written")
+	
+	filtered_df = main_df[ main_df["collection_date"].notna() & (main_df["collection_date"] != "") & main_df["country"].notna() & (main_df["country"] != "")].copy()
 
-	# Merge the tables
-	merged_df = pd.merge(
-		biosamples_df,
-		pathogens_df,
-		on="BioSample",
-		how="outer"  # Use 'outer' to keep all rows
-	)
-	merged_df = pd.merge(sources_df, merged_df, on = "BioSample", how= "right")
-
+	first_cols = ["BioSample","pathogens","refseq","genbank","atb","collection_date", "country", "city", "geographic_location"]
+	column_order = first_cols + [
+		col for col in filtered_df.columns if col not in first_cols
+	]
+	filtered_df = filtered_df[column_order]
+	filtered_df = filtered_df.loc[:, ~(filtered_df == "").all()]
+	###filtered_df = main_df[(main_df["BioSamples|collection_date"] != "") & (main_df["country"] != "")].copy()
+	filtered_df.to_csv(output_file_filtered,sep="\t",index=False)
+	
 	# Save the merged DataFrame
-	merged_df.to_csv(output_file, sep="\t", index=False)
-	info(f"Merged table saved to {output_file}")
+	info(f"Filtered table saved to {output_file_filtered}")
+
+
+
+def count_countries_and_years(samples, count_per_country, count_per_year, count_per_keyword):
+	if os.path.isfile(count_per_country) and os.path.isfile(count_per_year) and os.path.isfile(count_per_keyword):
+		info(f"{count_per_country} and {count_per_year} and {count_per_keyword} are ready, skip counting genomes per countries, years and keywords")
+		return True
+	
+	df = pd.read_csv(samples, sep="\t",dtype=str).fillna("unknown")
+	
+	# Group by 'country' and count the number of BioSample entries
+	if not os.path.isfile(count_per_country):
+		country_counts = sub.groupby('country')['BioSample'].count().reset_index()
+		country_counts.columns = ['country', 'genome_count']
+		country_counts = country_counts.sort_values(by='genome_count', ascending=False)
+		country_counts.to_csv(count_per_country,sep="\t", index=False)
+		info(f"Ready with {count_per_country}")
+	
+	#Create histogram for years
+	if not os.path.isfile(count_per_year):
+		sub["year"] = sub["collection_date"].str[:4]
+		year_counts = sub["year"].value_counts().sort_index()
+		plt.figure(figsize=(16, 6))  # Set the figure to be wide
+		plt.bar(year_counts.index, year_counts.values)
+		[plt.text(i, v + 0.5, str(v), ha='center', fontsize=10) for i, v in zip(range(len(year_counts)), year_counts.values)]
+		plt.xlabel("Year")
+		plt.ylabel("Number of genomes")
+		plt.title("Number of genomes per year")
+		plt.xticks(rotation=45)
+		plt.savefig(count_per_year, bbox_inches="tight")  # Save with tight layout
+		plt.close()  # Close the figure to avoid displaying it
+		info(f"Ready with {count_per_year}")
+	
+	if not os.path.isfile(count_per_keyword):
+		kw_dict = { kw : df.apply(lambda row: kw.lower() in " ".join(row.astype(str)).lower(), axis=1).sum() for kw in config['urine_keywords'] }
+		
+		with open(count_per_keyword,"w") as g:
+			wtr = csv.writer(g, delimiter="\t")
+			wtr.writerow(["Keyword", "Count"])
+			for k,v in kw_dict.items():
+				wtr.writerow([k, v])
+		
+		info(f"Ready with {count_per_keyword}")
 
 
 def fetch_read_identifiers(infile, batch_size=20):
@@ -449,6 +547,7 @@ def fetch_read_identifiers(infile, batch_size=20):
 	if os.path.isfile(downloaded_flag):
 		info("Read identifiers are already retrieved. Skipping this part.")
 		return
+	info("Fetching SRA read identifiers for the biosamples")
 	biosample_ids = get_biosamples(infile)
 	# Create batches of BioSamples
 	for i in range(0, len(biosample_ids), batch_size):
@@ -486,7 +585,8 @@ def concat_batches(infile, output_file, batch_size=20):
 		return
 	biosample_ids = get_biosamples(infile)
 	# Create batches of BioSamples
-	temp_files = [f"Metadata/Reads/genomes_batch_{i//batch_size + 1}.tsv" for i in range(0, len(biosample_ids), batch_size)]
+	temp_files = glob.glob("Metadata/Reads/genomes_batch*.tsv")
+	#temp_files = [f"Metadata/Reads/genomes_batch_{i//batch_size + 1}.tsv" for i in range(0, len(biosample_ids), batch_size)]
 
 	dfs = []
 	header = []
@@ -1019,28 +1119,48 @@ def trim_and_assembly(row):
 	msg(f"{sample}: Processing complete.")
 
 
+
 def download_raw_reads(row, sample):
 	"""Download raw reads if they do not exist."""
-	msg(f"Downloading {sample}")
-	status = {item: not item or (item and os.path.isfile(item) and check_gz_integrity(item)) for item in [row["SE"], row["R1"], row["R2"]]}
-	if all(status):
+	status = {item: not row[item] or check_gz_integrity(row[item]) for item in ["SE", "R1", "R2"]}
+	if all(status.values()):
 		msg(f"{sample}: Raw reads are already downloaded.")
 		return True
-	else:
-		msg(f"{sample}: Downloading raw reads...")
-		print(f"fasterq-dump {row['Run']} -q -t {config['fasterq']} -o {config['fasterq']} -m 1GB")
-		exit()
-		for item in [row['SE'], row['R1'], row['R2']]:
+	
+	msg(f"{sample}: Downloading raw reads...")
+	##!!source = row['fastq_ftp'].split(";")
+	##!!for item in source:
+	##!!	if item.endswith("_1.fastq.gz"):
+	##!!			ending = "R1"
+	##!!	elif item.endswith("_2.fastq.gz"):
+	##!!		ending = "R2"
+	##!!	else:
+	##!!		ending = "SE"
+	##!!	if not status[dst := row[ending]] and not os.path.isfile(part := f"{dst}.part"):
+	##!!		download_file(item, part)
+	##!!		if os.path.isfile(dst):
+	##!!			os.remove(dst)
+	##!!		shutil.move(part, dst)
+	
+	#Verifying downloaded files
+	##!!status = {item: not item or check_gz_integrity(item) for item in [row["SE"], row["R1"], row["R2"]]}
+	##!!if all(status):
+	##!!	msg(f"{sample}: finished downloading raw reads")
+	##!!	return True
+	##!!msg(f"{sample}: wget unsuccessful, trying fasterq-dump")
+	cmd = f"fasterq-dump {row['Run']} -q -t {config['fasterq']} -O {config['fasterq']} -m 1GB > /dev/null 2> /dev/null"
+	sysexec(cmd)
+	for item in [row['SE'], row['R1'], row['R2']]:
 			if item:
 				if os.path.isfile(source := os.path.join(config['fasterq'], Path(item).stem)):
 					sysexec(f"gzip -f {source}")
-					shutil.copy(f"{source}.gz", item)
+					shutil.move(f"{source}.gz", item)
 	for item in [row["SE"], row["R1"], row["R2"]]:
 		status[item] = not item or (item and os.path.isfile(item) and check_gz_integrity(item))
 	if not all([status[item] for item in [row["SE"], row["R1"], row["R2"]]]):
-		msg(f"{sample}: Error with downloading, missing files")
+		info(f"{sample}: Error with downloading, missing files")
 		return False
-		
+	return True
 
 
 def trim_reads(row, sample):
@@ -1145,7 +1265,7 @@ def cleanup_intermediate_files(row, assembly, denovo_path, deletion=False):
 		msg(f"{row['BioSample']}.{row['Run']}: Deleted intermediate files: {', '.join(deleted_files)}")
 
 
-def process_row_with_progress(row, progress_counter, active_counter, total_rows):
+def process_sample(row, progress_counter, active_counter, total_rows):
 	"""
 	Process a single row and update progress counters.
 
@@ -1194,6 +1314,8 @@ def run_trim_and_assembly_for_all_samples(commands):
 		
 	assembled_genomes = [os.path.basename(x) for x in glob.glob(os.path.join(config['assemblies'],"*.fna.gz"))]
 	
+	info(f"Assembly ready for {len(assembled_genomes)} genomes")
+	
 	# Step 2: Load commands from the TSV file
 	with open(commands, "r") as f:
 		reader = csv.DictReader(f, delimiter="\t")
@@ -1202,10 +1324,12 @@ def run_trim_and_assembly_for_all_samples(commands):
 	total_rows = len(rows)
 	msg(f"Processing {total_rows} genomes", onscreen=True)
 	
+	##DEBUG
 	##for row in rows:
 	##	trim_and_assembly(row)
-	##	exit()
+	##
 	# Step 3: Set up multiprocessing.Manager to manage shared state
+	
 	with mp.Manager() as manager:
 		progress_counter = manager.Value('i', 0)  # Shared counter for completed samples
 		active_counter = manager.Value('i', 0)    # Shared counter for currently active samples
@@ -1213,7 +1337,7 @@ def run_trim_and_assembly_for_all_samples(commands):
 		# Step 4: Run trim_and_assembly in parallel
 		with mp.Pool(pargs.n) as pool:  # pargs.n specifies the number of processes
 			pool.starmap(
-				process_row_with_progress,
+				process_sample,
 				[(row, progress_counter, active_counter, total_rows) for row in rows]
 			)
 
@@ -1247,23 +1371,27 @@ def main():
 	# Step 4: Fetch, convert, and filter biosample metadata
 
 	fetch_biosample_data(config["biosamples"], config["biosample_metadata"], config["biosample_metadata_fail"], config["biosample_metadata_log"])
-	get_urinary_pathogens(config["pathogens"], config["pathogens_urinary"])
 	convert_raw_biosamples_to_csv(config["biosample_metadata"], config["biosample_metadata_tsv"])
+	###get_urinary_pathogens(config["pathogens"], config["pathogens_urinary"])
 	get_urinary_biosamples(config["biosample_metadata_tsv"], config["biosample_urinary"])
 	
 	# Step 5: Merge tables and collect all metadata
-	merge_pathogens_and_biosample_metadata(config['pathogens_urinary'], config['biosample_urinary'], config['biosamples'], config['urinary'])
+	####merge_pathogens_and_biosample_metadata(config['pathogens_urinary'], config['biosample_urinary'], config['biosamples'], config['urinary'])
+	merge_pathogens_and_biosample_metadata(config['biosample_urinary'], config['biosamples'], config['pathogens'], config["geolocations"], config['urinary_full'], config['urinary_with_dates_and_locations'])
 	
-	filter_and_transform_genomes(config['urinary'], config["urinary_with_dates_and_locations"])
+	##surinary_genomes, biosample_sources, pathogen_metadata, geographic_locations, output_file_full, output_file_filtered
+	count_countries_and_years(config["urinary_with_dates_and_locations"], config["urinary_per_country"], config["urinary_per_year"], config["urinary_per_keyword"])
+	
 	
 	fetch_read_identifiers(config["urinary_with_dates_and_locations"])
 	concat_batches(config["urinary_with_dates_and_locations"], config['urinary_reads'])
-	#
-	####download_reads(config['urinary_reads'], config["urinary_with_dates_and_locations"], config["raw_reads"])
-	#
+	
+	#Downloading reference
 	get_reference_genome()
-	#
+	
+	#Create assemblies
 	commands = prepare_assembly_commands(config["urinary_with_dates_and_locations"], config['urinary_reads'], config['commands'])
+	
 	#This is the part for trimming and assembly
 	run_trim_and_assembly_for_all_samples(config['commands'])
 
